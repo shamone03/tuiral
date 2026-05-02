@@ -1,20 +1,24 @@
 use std::{
-    fs::OpenOptions,
-    io::{BufReader, BufWriter},
+    fs::{self, OpenOptions},
+    io::{BufReader, BufWriter, Read},
+    sync::mpsc::{self, Receiver, channel},
+    time::{Duration, SystemTime},
 };
 
+use crossterm::event::DisableMouseCapture;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
     layout::{Constraint, Layout, Rect},
     style::Style,
+    text::Text,
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 enum Element {
     String(String),
@@ -27,19 +31,19 @@ impl Default for Element {
     }
 }
 
-#[derive(Default, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Default, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 struct DashboardColumn {
     percent: Option<u16>,
     rows: Vec<DashboardWidget>,
 }
 
-#[derive(Default, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Default, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 struct DashboardWidget {
     element: Element,
     percent: Option<u16>,
 }
 
-#[derive(Default, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Default, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 struct DasboardLayout {
     columns: Vec<DashboardColumn>,
 }
@@ -97,23 +101,33 @@ impl App {
 
 impl App {
     fn render(&self, frame: &mut Frame) {
-        self.layout.clone().render(frame.area(), frame.buffer_mut());
+        frame.render_widget(self.layout.clone(), frame.area());
     }
 
     fn quit(&mut self) {
         self.exit = true
     }
 
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
+    fn run(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        configuration_update: Receiver<DasboardLayout>,
+    ) -> Result<(), std::io::Error> {
         terminal.clear()?;
         while !self.exit {
+            configuration_update.try_iter().for_each(|layout| {
+                terminal.clear().unwrap_or_default();
+                self.layout = layout
+            });
             terminal.draw(|frame| self.render(frame))?;
-            let event = event::read()?;
-            if let Event::Key(key) = event
-                && let KeyEventKind::Press = key.kind
-                && let KeyCode::Char('q') = key.code
-            {
-                self.quit()
+            if event::poll(Duration::from_millis(100))? {
+                let event = event::read()?;
+                if let Event::Key(key) = event
+                    && let KeyEventKind::Press = key.kind
+                    && let KeyCode::Char('q') = key.code
+                {
+                    self.quit()
+                }
             }
         }
         Ok(())
@@ -133,13 +147,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &schema_for!(DasboardLayout),
     )?;
     let configuration = "dashboard.json";
+    let mut terminal = ratatui::init();
     if std::fs::exists(configuration)? {
-        let mut terminal = ratatui::init();
-        App::default()
-            .with_layout(serde_json::from_reader(BufReader::new(
-                OpenOptions::new().read(true).open(configuration)?,
-            ))?)
-            .run(&mut terminal)?;
+        let (send, recv) = mpsc::channel::<DasboardLayout>();
+        let mut app = App::default().with_layout(serde_json::from_reader(BufReader::new(
+            OpenOptions::new().read(true).open(configuration)?,
+        ))?);
+        let join = std::thread::spawn(move || {
+            let mut contents = String::new();
+            BufReader::new(OpenOptions::new().read(true).open(configuration).unwrap())
+                .read_to_string(&mut contents)
+                .unwrap();
+            loop {
+                if let Ok(file) = OpenOptions::new().read(true).open(configuration) {
+                    let mut new_contents = String::new();
+                    BufReader::new(file)
+                        .read_to_string(&mut new_contents)
+                        .unwrap();
+                    if new_contents != contents {
+                        contents = new_contents;
+                        if let Ok(configuration) = serde_json::from_str(&contents)
+                            && let Err(_) = send.send(configuration)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        app.run(&mut terminal, recv)?;
         ratatui::restore();
 
         Ok(())

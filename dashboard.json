@@ -4,50 +4,15 @@
         {
             "rows": [
                 {
-                    "percent": 33,
-                    "element": "Test"
+                    "percent": 60,
+                    "element": "test"
                 },
                 {
-                    "percent": 33,
-                    "element": "Test"
+                    "percent": 46,
+                    "element": ""
                 },
                 {
-                    "percent": 34,
-                    "element": {
-                        "columns": [
-                            {
-                                "percent": 50,
-                                "rows": [
-                                    {
-                                        "element": "1"
-                                    }
-                                ]
-                            },
-                            {
-                                "percent": 50,
-                                "rows": [
-                                    {
-                                        "element": "2"
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                }
-            ]
-        },
-        {
-            "rows": [
-                {
-                    "percent": 33,
-                    "element": "Test"
-                },
-                {
-                    "percent": 33,
-                    "element": "Test"
-                },
-                {
-                    "percent": 34,
+                    "percent": 20,
                     "element": {
                         "columns": [
                             {
