@@ -1,0 +1,75 @@
+{
+    "$schema": "dashboard.schema.json",
+    "columns": [
+        {
+            "rows": [
+                {
+                    "percent": 33,
+                    "element": "Test"
+                },
+                {
+                    "percent": 33,
+                    "element": "Test"
+                },
+                {
+                    "percent": 34,
+                    "element": {
+                        "columns": [
+                            {
+                                "percent": 50,
+                                "rows": [
+                                    {
+                                        "element": "1"
+                                    }
+                                ]
+                            },
+                            {
+                                "percent": 50,
+                                "rows": [
+                                    {
+                                        "element": "2"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "rows": [
+                {
+                    "percent": 33,
+                    "element": "Test"
+                },
+                {
+                    "percent": 33,
+                    "element": "Test"
+                },
+                {
+                    "percent": 34,
+                    "element": {
+                        "columns": [
+                            {
+                                "percent": 50,
+                                "rows": [
+                                    {
+                                        "element": "1"
+                                    }
+                                ]
+                            },
+                            {
+                                "percent": 50,
+                                "rows": [
+                                    {
+                                        "element": "2"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
+}
