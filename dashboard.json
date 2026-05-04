@@ -8,8 +8,9 @@
                     "element": {
                         "command": "nu",
                         "args": [
+                            "-l",
                             "-c",
-                            "ls"
+                            "version"
                         ]
                     }
                 },

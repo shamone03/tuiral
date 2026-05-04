@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::{BufReader, BufWriter, Read},
-    process::{ChildStderr, ChildStdout},
     sync::mpsc::{self, Receiver},
     time::Duration,
 };
@@ -106,9 +105,10 @@ impl Widget for Element {
                 .render(area, buf),
             Element::Grid(dasboard_layout) => dasboard_layout.clone().render(area, buf),
             Element::Command(command) => {
+                // TODO: don't run on every render
                 let command_str = format!("{} {}", command.command, command.args.join(" "));
                 let out = command
-                    .run(area.width, area.height)
+                    .run(area.height, area.width)
                     .unwrap_or_else(|e| e.to_string());
                 let text = out.as_str().into_text().unwrap_or_default();
                 Paragraph::new(text)
@@ -211,9 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &schema_for!(DasboardLayout),
     )?;
     let configuration = "dashboard.json";
-    let mut terminal = ratatui::init();
-
     if std::fs::exists(configuration)? {
+        let mut terminal = ratatui::init();
         let (send, recv) = mpsc::channel::<DasboardLayout>();
         let mut app = App::default().with_layout(serde_json::from_reader(BufReader::new(
             OpenOptions::new().read(true).open(configuration)?,
@@ -236,7 +235,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         app.run(&mut terminal, recv)?;
         ratatui::restore();
-
         Ok(())
     } else {
         Err("no configuration")?
