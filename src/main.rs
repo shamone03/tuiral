@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use ansi_to_tui::IntoText as _;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -30,36 +31,36 @@ impl Command {
     fn run(self, rows: u16, cols: u16) -> Result<String, String> {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-        // Use the native pty implementation for the system
         let pty_system = native_pty_system();
 
-        // Create a new pty
-        let pair = pty_system
+        let emulator = pty_system
             .openpty(PtySize {
                 rows,
                 cols,
-                // Not all systems support pixel_width, pixel_height,
-                // but it is good practice to set it to something
-                // that matches the size of the selected font.  That
-                // is more complex than can be shown here in this
-                // brief example though!
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
 
-        // Spawn a shell into the pty
         let mut cmd = CommandBuilder::new(self.command);
         cmd.cwd(std::env::current_dir().map_err(|e| e.to_string())?);
         cmd.args(self.args);
-        let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+        let mut child = emulator
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| e.to_string())?;
+
         child.wait().map_err(|e| e.to_string())?;
-        drop(pair.slave);
 
-        // Read and parse output from the pty with reader
-        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        // dropping the slave will send a EOF to the terminal, allowing the read to happen without
+        // blocking?
+        drop(emulator.slave);
+
+        let mut reader = emulator
+            .master
+            .try_clone_reader()
+            .map_err(|e| e.to_string())?;
         let mut buf = String::new();
-
         reader.read_to_string(&mut buf).map_err(|e| e.to_string())?;
 
         Ok(buf)
@@ -109,7 +110,8 @@ impl Widget for Element {
                 let out = command
                     .run(area.width, area.height)
                     .unwrap_or_else(|e| e.to_string());
-                Paragraph::new(out)
+                let text = out.as_str().into_text().unwrap_or_default();
+                Paragraph::new(text)
                     .block(Block::new().borders(Borders::ALL).title(command_str))
                     .render(area, buf)
             }

@@ -5,7 +5,13 @@
             "rows": [
                 {
                     "percent": 60,
-                    "element": "test"
+                    "element": {
+                        "command": "nu",
+                        "args": [
+                            "-c",
+                            "ls"
+                        ]
+                    }
                 },
                 {
                     "percent": 46,
