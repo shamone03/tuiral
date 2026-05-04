@@ -9,7 +9,12 @@
                 },
                 {
                     "percent": 46,
-                    "element": ""
+                    "element": {
+                        "command": "git",
+                        "args": [
+                            "status"
+                        ]
+                    }
                 },
                 {
                     "percent": 20,

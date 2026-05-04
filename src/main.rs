@@ -2,36 +2,21 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::{BufReader, BufWriter, Read},
-    process::{ChildStderr, ChildStdout, Stdio},
+    process::{ChildStderr, ChildStdout},
     sync::mpsc::{self, Receiver},
     time::Duration,
 };
 
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
     layout::{Constraint, Layout, Rect},
-    style::Style,
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 
-enum ChildOutput {
-    Out(ChildStdout),
-    Err(ChildStderr),
-}
-
-impl std::io::Read for ChildOutput {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            ChildOutput::Out(child_stdout) => child_stdout.read(buf),
-            ChildOutput::Err(child_stderr) => child_stderr.read(buf),
-        }
-    }
-}
 #[derive(Default, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 struct Command {
     command: String,
@@ -43,32 +28,40 @@ struct Command {
 
 impl Command {
     fn run(self, rows: u16, cols: u16) -> Result<String, String> {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
         // Use the native pty implementation for the system
-        let pty_system = portable_pty::native_pty_system();
-        let terminal = pty_system
+        let pty_system = native_pty_system();
+
+        // Create a new pty
+        let pair = pty_system
             .openpty(PtySize {
                 rows,
                 cols,
+                // Not all systems support pixel_width, pixel_height,
+                // but it is good practice to set it to something
+                // that matches the size of the selected font.  That
+                // is more complex than can be shown here in this
+                // brief example though!
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
-        let cmd = CommandBuilder::new(self.command.clone());
-        let out = terminal.slave.spawn_command(cmd);
-        drop(terminal.slave);
 
-        let mut child = out.map_err(|e| e.to_string())?;
-
+        // Spawn a shell into the pty
+        let mut cmd = CommandBuilder::new(self.command);
+        cmd.cwd(std::env::current_dir().map_err(|e| e.to_string())?);
+        cmd.args(self.args);
+        let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         child.wait().map_err(|e| e.to_string())?;
-        drop(terminal.master.take_writer());
-        eprintln!("here");
+        drop(pair.slave);
+
+        // Read and parse output from the pty with reader
+        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut buf = String::new();
-        terminal
-            .master
-            .try_clone_reader()
-            .map_err(|e| e.to_string())?
-            .read_to_string(&mut buf)
-            .map_err(|e| e.to_string())?;
+
+        reader.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+
         Ok(buf)
     }
 }
@@ -203,50 +196,7 @@ impl App {
         Ok(())
     }
 }
-
-// fn collect_commands(layout: &DasboardLayout) -> impl Iterator<Item = Vec<Command>> {
-//     layout.columns.iter().map(|col| {
-//
-//         col.rows.into_iter()
-//         // col.rows.iter().filter_map(|row| match &row.element {
-//         //     Element::Command(command) => Some(vec![command.clone()]),
-//         //     Element::Grid(layout) => Some(collect_commands(layout).into_iter()),
-//         //     _ => None,
-//         // })
-//     })
-// }
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pty_system = NativePtySystem::default();
-
-    // Create a new pty
-    let mut pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
-    // Spawn a shell into the pty
-    let command = CommandBuilder::new("nu");
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
-
-    // Read and parse output from the pty with reader
-    let mut reader = pair.master.try_clone_reader()?;
-
-    // Send data to the pty by writing to the master
-    writeln!(pair.master.take_writer()?, "ls\r\n\x04")?;
-    drop(pair.master);
-
-    let mut out = String::new();
-    reader.read_to_string(&mut out)?;
-    println!("{}", out);
-
-    println!("{}", child.wait()?);
-    Ok(())
-}
-fn _main() -> Result<(), Box<dyn std::error::Error>> {
     let schema = "dashboard.schema.json";
     serde_json::to_writer_pretty(
         BufWriter::new(
@@ -260,68 +210,33 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let configuration = "dashboard.json";
     let mut terminal = ratatui::init();
-    let size = terminal.size()?;
-    // Use the native pty implementation for the system
-    let pty_system = portable_pty::native_pty_system();
 
-    let mut emulator = pty_system.openpty(PtySize {
-        rows: size.width,
-        cols: size.height,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    if std::fs::exists(configuration)? {
+        let (send, recv) = mpsc::channel::<DasboardLayout>();
+        let mut app = App::default().with_layout(serde_json::from_reader(BufReader::new(
+            OpenOptions::new().read(true).open(configuration)?,
+        ))?);
+        // TODO: join thread before app quits
+        let _ = std::thread::spawn(move || {
+            let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
+            loop {
+                let new_contents = std::fs::read_to_string(configuration).unwrap_or_default();
+                if new_contents != contents {
+                    contents = new_contents;
+                    if let Ok(configuration) = serde_json::from_str(&contents)
+                        && let Err(_) = send.send(configuration)
+                    {
+                        break;
+                    }
+                }
+            }
+        });
 
-    // Spawn a shell into the pty
-    let mut cmd = CommandBuilder::new("nu");
-    cmd.args(["-c", "ls"]);
+        app.run(&mut terminal, recv)?;
+        ratatui::restore();
 
-    let mut child = emulator.slave.spawn_command(cmd)?;
-
-    // Read and parse output from the pty with reader
-    let mut reader = emulator.master.try_clone_reader()?;
-    //
-    // // Send data to the pty by writing to the master
-    // writeln!(emulator.master.take_writer()?, "ls -l\r\n")?;
-    //
-    let mut out = String::new();
-    reader.read_to_string(&mut out)?;
-    println!("{out}");
-
-    ratatui::restore();
-    // if std::fs::exists(configuration)? {
-    //     let (send, recv) = mpsc::channel::<DasboardLayout>();
-    //     let mut app = App::default().with_layout(serde_json::from_reader(BufReader::new(
-    //         OpenOptions::new().read(true).open(configuration)?,
-    //     ))?);
-    //     // TODO: join thread before app quits
-    //     let _ = std::thread::spawn(move || {
-    //         let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
-    //         loop {
-    //             let new_contents = std::fs::read_to_string(configuration).unwrap_or_default();
-    //             if new_contents != contents {
-    //                 contents = new_contents;
-    //                 if let Ok(configuration) = serde_json::from_str(&contents)
-    //                     && let Err(_) = send.send(configuration)
-    //                 {
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     });
-    //
-    //     let command = Command {
-    //         command: "nu".to_string(),
-    //         ..Default::default()
-    //     };
-    //
-    //     command.run(terminal.size()?.width, terminal.size()?.height)?;
-    //
-    //     // app.run(&mut terminal, recv)?;
-    //     ratatui::restore();
-    //
-    //     Ok(())
-    // } else {
-    //     Err("no configuration")?
-    // }
-    Ok(())
+        Ok(())
+    } else {
+        Err("no configuration")?
+    }
 }
