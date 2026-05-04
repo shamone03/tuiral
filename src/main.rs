@@ -10,12 +10,17 @@ use ansi_to_tui::IntoText as _;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+    crossterm::event::{self, KeyCode, KeyEventKind},
     layout::{Constraint, Layout, Rect},
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
+
+enum Event {
+    Quit,
+    LayoutUpdate(DasboardLayout),
+}
 
 #[derive(Default, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 struct Command {
@@ -152,13 +157,20 @@ impl Widget for DasboardLayout {
     }
 }
 
-#[derive(Default)]
 struct App {
     exit: bool,
     layout: DasboardLayout,
+    events: Receiver<Event>,
 }
 
 impl App {
+    fn new(events: Receiver<Event>) -> Self {
+        Self {
+            exit: false,
+            layout: DasboardLayout::default(),
+            events,
+        }
+    }
     fn with_layout(self, layout: DasboardLayout) -> Self {
         Self { layout, ..self }
     }
@@ -169,35 +181,44 @@ impl App {
         frame.render_widget(self.layout.clone(), frame.area());
     }
 
-    fn quit(&mut self) {
-        self.exit = true
-    }
-
-    fn run(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        configuration_update: Receiver<DasboardLayout>,
-    ) -> Result<(), std::io::Error> {
-        terminal.clear()?;
-        while !self.exit {
-            configuration_update.try_iter().for_each(|layout| {
+    fn process_event(&mut self, terminal: &mut DefaultTerminal) {
+        self.events.try_iter().for_each(|e| match e {
+            Event::LayoutUpdate(layout) => {
                 terminal.clear().unwrap_or_default();
                 self.layout = layout
-            });
-            terminal.draw(|frame| self.render(frame))?;
-            if event::poll(Duration::from_millis(100))? {
-                let event = event::read()?;
-                if let Event::Key(key) = event
-                    && let KeyEventKind::Press = key.kind
-                    && let KeyCode::Char('q') = key.code
-                {
-                    self.quit()
-                }
             }
+            Event::Quit => self.exit = true,
+        });
+    }
+
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
+        terminal.clear()?;
+        while !self.exit {
+            self.process_event(terminal);
+            terminal.draw(|frame| self.render(frame))?;
         }
         Ok(())
     }
 }
+
+fn collect_commands(layout: DasboardLayout) -> Vec<Command> {
+    layout
+        .columns
+        .into_iter()
+        .flat_map(|col| {
+            col.rows
+                .into_iter()
+                .map(|row| row.element)
+                .filter_map(|elem| match elem {
+                    Element::Command(command) => Some(vec![command]),
+                    Element::Grid(layout) => Some(collect_commands(layout)),
+                    _ => None,
+                })
+        })
+        .flatten()
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema = "dashboard.schema.json";
     serde_json::to_writer_pretty(
@@ -213,10 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let configuration = "dashboard.json";
     if std::fs::exists(configuration)? {
         let mut terminal = ratatui::init();
-        let (send, recv) = mpsc::channel::<DasboardLayout>();
-        let mut app = App::default().with_layout(serde_json::from_reader(BufReader::new(
-            OpenOptions::new().read(true).open(configuration)?,
-        ))?);
+        let (send, recv) = mpsc::channel::<Event>();
         // TODO: join thread before app quits
         let _ = std::thread::spawn(move || {
             let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
@@ -224,16 +242,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new_contents = std::fs::read_to_string(configuration).unwrap_or_default();
                 if new_contents != contents {
                     contents = new_contents;
-                    if let Ok(configuration) = serde_json::from_str(&contents)
-                        && let Err(_) = send.send(configuration)
+                    if let Ok(configuration) = serde_json::from_str::<DasboardLayout>(&contents)
+                        && let Err(_) = send.send(Event::LayoutUpdate(configuration))
                     {
                         break;
                     }
                 }
+                if event::poll(Duration::from_millis(100)).is_ok_and(|avail| avail)
+                    && let Ok(event) = event::read()
+                    && let crossterm::event::Event::Key(key) = event
+                    && let KeyEventKind::Press = key.kind
+                    && let KeyCode::Char('q') = key.code
+                {
+                    let _ = send.send(Event::Quit);
+                }
             }
         });
 
-        app.run(&mut terminal, recv)?;
+        let layout: DasboardLayout = serde_json::from_reader(BufReader::new(
+            OpenOptions::new().read(true).open(configuration)?,
+        ))?;
+        let all_commands = collect_commands(layout.clone());
+
+        let mut app = App::new(recv).with_layout(layout);
+
+        app.run(&mut terminal)?;
         ratatui::restore();
         Ok(())
     } else {
