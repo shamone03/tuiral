@@ -4,46 +4,8 @@
         {
             "rows": [
                 {
-                    "percent": 60,
                     "element": {
-                        "command": "nu",
-                        "args": [
-                            "-l",
-                            "-c",
-                            "version"
-                        ]
-                    }
-                },
-                {
-                    "percent": 46,
-                    "element": {
-                        "command": "git",
-                        "args": [
-                            "status"
-                        ]
-                    }
-                },
-                {
-                    "percent": 20,
-                    "element": {
-                        "columns": [
-                            {
-                                "percent": 50,
-                                "rows": [
-                                    {
-                                        "element": "1"
-                                    }
-                                ]
-                            },
-                            {
-                                "percent": 50,
-                                "rows": [
-                                    {
-                                        "element": "2"
-                                    }
-                                ]
-                            }
-                        ]
+                        "command": "bash"
                     }
                 }
             ]

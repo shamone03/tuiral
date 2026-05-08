@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    io::{BufReader, BufWriter, Read},
-    sync::mpsc::{self, Receiver},
+    io::{BufReader, BufWriter, Read, Write},
+    sync::mpsc::{self, Receiver, Sender},
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 use ansi_to_tui::IntoText as _;
+use crossterm::event::KeyModifiers;
+use portable_pty::Child;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -29,6 +32,86 @@ struct Command {
     args: Vec<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+}
+
+impl Command {
+    fn to_string(&self) -> String {
+        format!("{} {}", self.command, self.args.join(" "))
+    }
+}
+
+struct CommandRunner {
+    reader: Receiver<Vec<u8>>,
+    writer: Sender<Vec<u8>>,
+    writer_handle: JoinHandle<()>,
+    reader_handle: JoinHandle<()>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl CommandRunner {
+    fn new(command: Command, rows: u16, cols: u16) -> Result<Self, String> {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+        let pty_system = native_pty_system();
+
+        let emulator = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut cmd = CommandBuilder::new(command.command);
+        cmd.cwd(std::env::current_dir().map_err(|e| e.to_string())?);
+        cmd.args(command.args);
+        let child = emulator
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| e.to_string())?;
+        drop(emulator.slave);
+
+        let mut reader = emulator
+            .master
+            .try_clone_reader()
+            .map_err(|e| e.to_string())?;
+        let mut writer = emulator.master.take_writer().map_err(|e| e.to_string())?;
+
+        let (command_writer, input) = mpsc::channel::<Vec<u8>>();
+        let writer_handle = thread::spawn(move || {
+            loop {
+                match input.try_recv() {
+                    Ok(what) => writer.write(&what),
+                    Err(e) => break,
+                };
+            }
+        });
+
+        let (output, command_reader) = mpsc::channel::<Vec<u8>>();
+        let reader_handle = thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let _ = output.send(buffer[..n].iter().cloned().collect());
+                    }
+                    Err(e) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            reader: command_reader,
+            writer: command_writer,
+            reader_handle,
+            writer_handle,
+            child,
+        })
+    }
 }
 
 impl Command {
@@ -161,14 +244,16 @@ struct App {
     exit: bool,
     layout: DasboardLayout,
     events: Receiver<Event>,
+    commands: HashMap<String, Receiver<Vec<u8>>>,
 }
 
 impl App {
-    fn new(events: Receiver<Event>) -> Self {
+    fn new(events: Receiver<Event>, commands: HashMap<String, Receiver<Vec<u8>>>) -> Self {
         Self {
             exit: false,
             layout: DasboardLayout::default(),
             events,
+            commands,
         }
     }
     fn with_layout(self, layout: DasboardLayout) -> Self {
@@ -192,11 +277,17 @@ impl App {
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
-        terminal.clear()?;
-        while !self.exit {
-            self.process_event(terminal);
-            terminal.draw(|frame| self.render(frame))?;
-        }
+        // terminal.clear()?;
+        // while !self.exit {
+        //     self.process_event(terminal);
+        //     terminal.draw(|frame| self.render(frame))?;
+        // }
+        //
+        self.commands.iter().for_each(|(id, recv)| {
+            for msg in recv {
+                println!("{id}: {}", String::from_utf8(msg).unwrap());
+            }
+        });
         Ok(())
     }
 }
@@ -235,6 +326,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::fs::exists(configuration)? {
         let mut terminal = ratatui::init();
         let (send, recv) = mpsc::channel::<Event>();
+
+        let layout: DasboardLayout = serde_json::from_reader(BufReader::new(
+            OpenOptions::new().read(true).open(configuration)?,
+        ))?;
+        let size = terminal.size()?;
+        let runners = collect_commands(layout.clone()).into_iter().try_fold(
+            HashMap::new(),
+            |mut accum, command| {
+                accum.insert(
+                    command.to_string(),
+                    CommandRunner::new(command, size.height, size.width)?,
+                );
+                Ok::<_, String>(accum)
+            },
+        )?;
+        let mut writers = runners
+            .iter()
+            .map(|(id, command)| (id.clone(), command.writer.clone()))
+            .collect::<HashMap<_, _>>();
+
         // TODO: join thread before app quits
         let _ = std::thread::spawn(move || {
             let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
@@ -252,19 +363,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && let Ok(event) = event::read()
                     && let crossterm::event::Event::Key(key) = event
                     && let KeyEventKind::Press = key.kind
-                    && let KeyCode::Char('q') = key.code
                 {
-                    let _ = send.send(Event::Quit);
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && let KeyCode::Char('q') = key.code
+                    {
+                        let _ = send.send(Event::Quit);
+                    } else if let KeyCode::Char(letter) = key.code {
+                        writers.iter_mut().for_each(|(_, writer)| {
+                            let bytes = letter.to_string().bytes().collect::<Vec<_>>();
+                            writer.send(bytes).unwrap();
+                        });
+                    }
                 }
             }
         });
 
-        let layout: DasboardLayout = serde_json::from_reader(BufReader::new(
-            OpenOptions::new().read(true).open(configuration)?,
-        ))?;
-        let all_commands = collect_commands(layout.clone());
-
-        let mut app = App::new(recv).with_layout(layout);
+        let receivers = runners
+            .into_iter()
+            .map(|(id, runner)| (id, runner.reader))
+            .collect();
+        let mut app = App::new(recv, receivers).with_layout(layout);
 
         app.run(&mut terminal)?;
         ratatui::restore();
