@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use ansi_to_tui::IntoText as _;
+use ansi_to_tui::IntoText;
 use crossterm::event::KeyModifiers;
 use portable_pty::Child;
 use ratatui::{
@@ -63,46 +63,49 @@ impl CommandRunner {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut cmd = CommandBuilder::new(command.command);
+        let mut cmd = CommandBuilder::new(command.clone().command);
         cmd.cwd(std::env::current_dir().map_err(|e| e.to_string())?);
-        cmd.args(command.args);
+        cmd.args(command.clone().args);
         let child = emulator
             .slave
             .spawn_command(cmd)
             .map_err(|e| e.to_string())?;
         drop(emulator.slave);
 
-        let mut reader = emulator
+        let mut emulator_reader = emulator
             .master
             .try_clone_reader()
             .map_err(|e| e.to_string())?;
-        let mut writer = emulator.master.take_writer().map_err(|e| e.to_string())?;
 
+        let mut emulator_writer = emulator.master.take_writer().map_err(|e| e.to_string())?;
         let (command_writer, input) = mpsc::channel::<Vec<u8>>();
-        let writer_handle = thread::spawn(move || {
-            loop {
-                match input.try_recv() {
-                    Ok(what) => writer.write(&what),
-                    Err(e) => break,
-                };
-            }
-        });
+        let writer_handle = std::thread::Builder::new()
+            .name(format!("reading {} input", command.clone().to_string()))
+            .spawn(move || {
+                input.iter().for_each(|input| {
+                    emulator_writer.write_all(&input).unwrap();
+                });
+            })
+            .map_err(|e| e.to_string())?;
 
         let (output, command_reader) = mpsc::channel::<Vec<u8>>();
-        let reader_handle = thread::spawn(move || {
-            let mut buffer = [0u8; 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let _ = output.send(buffer[..n].iter().cloned().collect());
-                    }
-                    Err(e) => {
-                        break;
+        let reader_handle = std::thread::Builder::new()
+            .name(format!("reading {} output", command.to_string()))
+            .spawn(move || {
+                let mut buffer = [0u8; 1024];
+                loop {
+                    match emulator_reader.read(&mut buffer) {
+                        Ok(0) => panic!(), // EOF
+                        Ok(n) => {
+                            output.send(buffer[..n].to_vec()).unwrap();
+                        }
+                        Err(e) => {
+                            panic!()
+                        }
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| e.to_string())?;
 
         Ok(Self {
             reader: command_reader,
@@ -244,16 +247,21 @@ struct App {
     exit: bool,
     layout: DasboardLayout,
     events: Receiver<Event>,
-    commands: HashMap<String, Receiver<Vec<u8>>>,
+    commands: HashMap<String, (Receiver<Vec<u8>>, Box<dyn Child + Send + Sync>)>,
+    command_buffer: Vec<u8>,
 }
 
 impl App {
-    fn new(events: Receiver<Event>, commands: HashMap<String, Receiver<Vec<u8>>>) -> Self {
+    fn new(
+        events: Receiver<Event>,
+        commands: HashMap<String, (Receiver<Vec<u8>>, Box<dyn Child + Send + Sync>)>,
+    ) -> Self {
         Self {
             exit: false,
             layout: DasboardLayout::default(),
             events,
             commands,
+            command_buffer: Default::default(),
         }
     }
     fn with_layout(self, layout: DasboardLayout) -> Self {
@@ -278,16 +286,35 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
         // terminal.clear()?;
-        // while !self.exit {
-        //     self.process_event(terminal);
-        //     terminal.draw(|frame| self.render(frame))?;
-        // }
-        //
-        self.commands.iter().for_each(|(id, recv)| {
-            for msg in recv {
-                println!("{id}: {}", String::from_utf8(msg).unwrap());
-            }
-        });
+        while !self.exit {
+            self.process_event(terminal);
+            self.commands.iter_mut().for_each(|(id, (recv, child))| {
+                match child.try_wait() {
+                    Ok(status) => {
+                        if let Some(status) = status {
+                            print!("exited {}", status.exit_code());
+                        }
+                    }
+                    Err(err) => panic!(),
+                }
+                match recv.try_recv() {
+                    Ok(mut msg) => {
+                        self.command_buffer.append(&mut msg);
+                    }
+                    Err(e) => match e {
+                        mpsc::TryRecvError::Empty => {}
+                        mpsc::TryRecvError::Disconnected => panic!(),
+                    },
+                }
+            });
+            terminal.draw(|frame| {
+                self.command_buffer
+                    .to_text()
+                    .unwrap()
+                    .render(frame.area(), frame.buffer_mut())
+            })?;
+            // terminal.draw(|frame| self.render(frame))?;
+        }
         Ok(())
     }
 }
@@ -347,40 +374,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<HashMap<_, _>>();
 
         // TODO: join thread before app quits
-        let _ = std::thread::spawn(move || {
-            let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
-            loop {
-                let new_contents = std::fs::read_to_string(configuration).unwrap_or_default();
-                if new_contents != contents {
-                    contents = new_contents;
-                    if let Ok(configuration) = serde_json::from_str::<DasboardLayout>(&contents)
-                        && let Err(_) = send.send(Event::LayoutUpdate(configuration))
+        let _ = std::thread::Builder::new()
+            .name("input".to_string())
+            .spawn(move || {
+                let mut contents = std::fs::read_to_string(configuration).unwrap_or_default();
+                loop {
+                    let new_contents = std::fs::read_to_string(configuration).unwrap_or_default();
+                    if new_contents != contents {
+                        contents = new_contents;
+                        if let Ok(configuration) = serde_json::from_str::<DasboardLayout>(&contents)
+                            && let Err(_) = send.send(Event::LayoutUpdate(configuration))
+                        {
+                            break;
+                        }
+                    }
+                    if event::poll(Duration::from_millis(100)).is_ok_and(|avail| avail)
+                        && let Ok(event) = event::read()
+                        && let crossterm::event::Event::Key(key) = event
+                        && let KeyEventKind::Press = key.kind
                     {
-                        break;
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && let KeyCode::Char('q') = key.code
+                        {
+                            let _ = send.send(Event::Quit);
+                        } else if let KeyCode::Char(letter) = key.code {
+                            writers.iter_mut().for_each(|(_, writer)| {
+                                let bytes = letter.to_string().bytes().collect::<Vec<_>>();
+                                writer.send(bytes).unwrap();
+                            });
+                        } else if let KeyCode::Enter = key.code{
+                            writers.iter_mut().for_each(|(_, writer)| {
+                                writer.send("\n".to_string().into_bytes()).unwrap();
+                            });
+                        }
                     }
                 }
-                if event::poll(Duration::from_millis(100)).is_ok_and(|avail| avail)
-                    && let Ok(event) = event::read()
-                    && let crossterm::event::Event::Key(key) = event
-                    && let KeyEventKind::Press = key.kind
-                {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && let KeyCode::Char('q') = key.code
-                    {
-                        let _ = send.send(Event::Quit);
-                    } else if let KeyCode::Char(letter) = key.code {
-                        writers.iter_mut().for_each(|(_, writer)| {
-                            let bytes = letter.to_string().bytes().collect::<Vec<_>>();
-                            writer.send(bytes).unwrap();
-                        });
-                    }
-                }
-            }
-        });
+            });
 
         let receivers = runners
             .into_iter()
-            .map(|(id, runner)| (id, runner.reader))
+            .map(|(id, runner)| (id.to_string(), (runner.reader, runner.child)))
             .collect();
         let mut app = App::new(recv, receivers).with_layout(layout);
 
