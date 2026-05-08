@@ -285,7 +285,7 @@ impl App {
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
-        // terminal.clear()?;
+        terminal.clear()?;
         while !self.exit {
             self.process_event(terminal);
             self.commands.iter_mut().for_each(|(id, (recv, child))| {
@@ -293,6 +293,7 @@ impl App {
                     Ok(status) => {
                         if let Some(status) = status {
                             print!("exited {}", status.exit_code());
+                            self.exit = true
                         }
                     }
                     Err(err) => panic!(),
@@ -303,15 +304,16 @@ impl App {
                     }
                     Err(e) => match e {
                         mpsc::TryRecvError::Empty => {}
-                        mpsc::TryRecvError::Disconnected => panic!(),
+                        mpsc::TryRecvError::Disconnected => { self.command_buffer = String::from("process exited").into_bytes(); },
                     },
                 }
             });
-            terminal.draw(|frame| {
+            terminal.try_draw(|frame| {
                 self.command_buffer
                     .to_text()
-                    .unwrap()
-                    .render(frame.area(), frame.buffer_mut())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                    .render(frame.area(), frame.buffer_mut());
+                Ok::<_, std::io::Error>(())
             })?;
             // terminal.draw(|frame| self.render(frame))?;
         }
@@ -397,15 +399,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && let KeyCode::Char('q') = key.code
                         {
                             let _ = send.send(Event::Quit);
-                        } else if let KeyCode::Char(letter) = key.code {
-                            writers.iter_mut().for_each(|(_, writer)| {
-                                let bytes = letter.to_string().bytes().collect::<Vec<_>>();
-                                writer.send(bytes).unwrap();
+                        }
+                        // else if let KeyCode::Char(letter) = key.code {
+                        //     writers.iter_mut().for_each(|(_, writer)| {
+                        //         let bytes = letter.to_string().bytes().collect::<Vec<_>>();
+                        //         writer.send(bytes).unwrap();
+                        //     });
+                        // } else if let KeyCode::Enter = key.code {
+                        //     writers.iter_mut().for_each(|(_, writer)| {
+                        //         writer.send("\n".to_string().into_bytes()).unwrap();
+                        //     });
+                        // }
+                    }
+
+                    let mut buffer = [0u8; 1024];
+                    match std::io::stdin().read(&mut buffer) {
+                        Ok(0) => panic!(), // EOF
+                        Ok(n) => {
+                            writers.iter().for_each(|(_, writer)| {
+                                writer.send(buffer[..n].to_vec()).unwrap();
                             });
-                        } else if let KeyCode::Enter = key.code {
-                            writers.iter_mut().for_each(|(_, writer)| {
-                                writer.send("\n".to_string().into_bytes()).unwrap();
-                            });
+                        }
+                        Err(e) => {
+                            panic!()
                         }
                     }
                 }

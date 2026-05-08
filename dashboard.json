@@ -5,10 +5,7 @@
             "rows": [
                 {
                     "element": {
-                        "command": "nu",
-                        "args": [
-                            "--no-config-file"
-                        ]
+                        "command": "bash"
                     }
                 }
             ]
