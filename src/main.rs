@@ -402,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let bytes = letter.to_string().bytes().collect::<Vec<_>>();
                                 writer.send(bytes).unwrap();
                             });
-                        } else if let KeyCode::Enter = key.code{
+                        } else if let KeyCode::Enter = key.code {
                             writers.iter_mut().for_each(|(_, writer)| {
                                 writer.send("\n".to_string().into_bytes()).unwrap();
                             });
